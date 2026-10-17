@@ -1,8 +1,39 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import remoteControlExtension, { __resetRemoteControlExtensionStateForTests, collectRuntimeStatus, enrichTuiEventForDaemon, handleRemoteCommand } from "../src/extension/index.js";
+
+const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
+vi.mock("node:child_process", () => ({ spawn: spawnMock }));
+
+type FakeChild = {
+  once(event: string, handler: (...args: unknown[]) => void): FakeChild;
+  removeListener(event: string, handler: (...args: unknown[]) => void): FakeChild;
+  unref(): void;
+  emit(event: string, ...args: unknown[]): void;
+};
+
+function createFakeChild(onSpawned?: (child: FakeChild) => void): FakeChild {
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const child: FakeChild = {
+    once(event, handler) {
+      listeners.set(event, [...(listeners.get(event) ?? []), handler]);
+      return child;
+    },
+    removeListener(event, handler) {
+      listeners.set(event, (listeners.get(event) ?? []).filter((candidate) => candidate !== handler));
+      return child;
+    },
+    unref() {},
+    emit(event, ...args) {
+      for (const handler of listeners.get(event) ?? []) handler(...args);
+    },
+  };
+  onSpawned?.(child);
+  return child;
+}
+
 
 type Registered = {
   name: string;
@@ -100,6 +131,9 @@ function createContext() {
 beforeEach(() => {
   vi.stubEnv("PI_REMOTE_CONTROL_LOCAL_URL", "http://127.0.0.1:17373");
   vi.stubEnv("PI_REMOTE_CONTROL_DEV_TOKEN", "test-token");
+  vi.stubEnv("PI_REMOTE_CONTROL_LOG", join(tmpdir(), "pi-remote-control-extension-test.log"));
+  spawnMock.mockClear();
+  spawnMock.mockImplementation(() => createFakeChild());
 });
 
 afterEach(() => {
@@ -178,9 +212,13 @@ describe("remote control extension", () => {
 
     await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
 
-    expect(execCalls[0]).toEqual({ command: process.execPath, args: [expect.stringContaining("src/cli-runner.cjs"), "status"] });
-    expect(execCalls[1]?.command).toBe("sh");
-    expect(execCalls[1]?.args[1]).toContain("nohup");
+    expect(execCalls[0]).toEqual({ command: process.execPath, args: [expect.stringContaining(join("src", "cli-runner.cjs")), "status"] });
+    expect(execCalls.length).toBe(1);
+    expect(spawnMock).toHaveBeenCalledWith(
+      process.execPath,
+      [expect.stringContaining(join("src", "cli-runner.cjs")), "start"],
+      expect.objectContaining({ detached: true, windowsHide: true }),
+    );
     expect(fetchCalls).toEqual([
       { url: "http://127.0.0.1:17373/v1/health", init: undefined },
       { url: "http://127.0.0.1:17373/v1/health", init: undefined },
@@ -200,7 +238,7 @@ describe("remote control extension", () => {
     expect(notifications.at(-1)).toEqual({ message: "Remote control enabled for this session", type: "info" });
   });
 
-  it("passes the launching Pi entry point to the daemon with shell-safe quoting", async () => {
+  it("passes the launching Pi entry point to the daemon environment", async () => {
     const { pi, commands } = createFakePi();
     const { ctx } = createContext();
     const exec = vi.fn(async (_command: string, args: string[]) => ({
@@ -214,8 +252,10 @@ describe("remote control extension", () => {
     try {
       remoteControlExtension(pi as never);
       await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
-      expect(exec.mock.calls[1]?.[1][1]).toContain("PI_REMOTE_CONTROL_PI_ENTRY='/opt/Pi'\\''s installation/dist/cli.js' nohup ");
-      expect(process.env.PI_REMOTE_CONTROL_PI_ENTRY).not.toBe(hostEntry);
+      const options = spawnMock.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv };
+      expect(options.env.PI_REMOTE_CONTROL_PI_ENTRY).toBe(resolve(hostEntry));
+      expect(options.env.PI_REMOTE_CONTROL_PI_ENTRY).not.toMatch(/^'|'$/);
+      expect(process.env.PI_REMOTE_CONTROL_PI_ENTRY).toBeUndefined();
     } finally {
       process.argv = originalArgv;
     }
@@ -356,9 +396,60 @@ describe("remote control extension", () => {
     await expect(commands.find((command) => command.name === "remote-control")!.handler("", ctx)).resolves.toBeUndefined();
 
     expect(notifications.at(-1)).toEqual({
-      message: "pi-remote-control did not become ready; see /tmp/pi-remote-control.log",
+      message: `pi-remote-control did not become ready; see ${join(tmpdir(), "pi-remote-control-extension-test.log")}`,
       type: "error",
     });
+  });
+
+  it("reports a daemon that dies during startup instead of timing out", async () => {
+    const commands: Registered[] = [];
+    const { ctx, notifications } = createContext();
+    const pi = {
+      registerCommand(name: string, options: Omit<Registered, "name">) {
+        commands.push({ name, ...options });
+      },
+      on: vi.fn(),
+      sendUserMessage: vi.fn(),
+      exec: async (_command: string, args: string[]) => ({
+        stdout: "", stderr: "", code: args.includes("status") ? 1 : 0, killed: false,
+      }),
+    };
+    vi.stubEnv("PI_REMOTE_CONTROL_READY_ATTEMPTS", "1");
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("fetch failed"); }));
+    spawnMock.mockImplementation(() => createFakeChild((child) => {
+      setTimeout(() => child.emit("exit", 1, null), 0);
+    }));
+    remoteControlExtension(pi as never);
+
+    await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+
+    expect(notifications.at(-1)?.message).toContain("pi-remote-control exited (1) before becoming ready");
+    expect(notifications.at(-1)?.type).toBe("error");
+  });
+
+  it("reports a launch failure such as a missing runtime instead of timing out", async () => {
+    const commands: Registered[] = [];
+    const { ctx, notifications } = createContext();
+    const pi = {
+      registerCommand(name: string, options: Omit<Registered, "name">) {
+        commands.push({ name, ...options });
+      },
+      on: vi.fn(),
+      sendUserMessage: vi.fn(),
+      exec: async (_command: string, args: string[]) => ({
+        stdout: "", stderr: "", code: args.includes("status") ? 1 : 0, killed: false,
+      }),
+    };
+    vi.stubEnv("PI_REMOTE_CONTROL_READY_ATTEMPTS", "1");
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("fetch failed"); }));
+    spawnMock.mockImplementation(() => createFakeChild((child) => {
+      setTimeout(() => child.emit("error", Object.assign(new Error("spawn sh ENOENT"), { code: "ENOENT" })), 0);
+    }));
+    remoteControlExtension(pi as never);
+
+    await commands.find((command) => command.name === "remote-control")!.handler("", ctx);
+
+    expect(notifications.at(-1)?.message).toContain("pi-remote-control could not start: spawn sh ENOENT");
   });
 
   it("reports registration network failures without throwing", async () => {
@@ -1395,8 +1486,8 @@ describe("remote control extension", () => {
     await commands.find((command) => command.name === "remote-control-pair")!.handler("", ctx);
 
     expect(execCalls).toEqual([
-      { command: process.execPath, args: [expect.stringContaining("src/cli-runner.cjs"), "status"] },
-      { command: process.execPath, args: [expect.stringContaining("src/cli-runner.cjs"), "pair"] },
+      { command: process.execPath, args: [expect.stringContaining(join("src", "cli-runner.cjs")), "status"] },
+      { command: process.execPath, args: [expect.stringContaining(join("src", "cli-runner.cjs")), "pair"] },
     ]);
     expect(notifications).toEqual([{ message: "Pairing link: pi-remote://pair?...", type: "info" }]);
   });
