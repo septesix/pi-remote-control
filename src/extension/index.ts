@@ -1,5 +1,7 @@
-import { existsSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, openSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RemoteTuiCommand } from "../active-session-registry.js";
@@ -81,7 +83,7 @@ export default function remoteControlExtension(pi: ExtensionAPI): void {
       try {
         await ensureDaemonStarted(pi);
       } catch (error) {
-        ctx.ui.notify(`${error instanceof Error ? error.message : String(error)}; see /tmp/pi-remote-control.log`, "error");
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         return;
       }
       const sessionId = daemonSessionId(ctx);
@@ -126,13 +128,14 @@ export default function remoteControlExtension(pi: ExtensionAPI): void {
   pi.registerCommand("remote-control-pair", {
     description: "Display a QR pairing link for Pi Remote Control",
     handler: async (_args, ctx) => {
+      let cli: { command: string; args: string[] };
       try {
         await ensureDaemonStarted(pi);
+        cli = cliCommand();
       } catch (error) {
-        ctx.ui.notify(`${error instanceof Error ? error.message : String(error)}; see /tmp/pi-remote-control.log`, "error");
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
         return;
       }
-      const cli = cliCommand();
       const result = await pi.exec(cli.command, [...cli.args, "pair"]);
       const stdout = result.stdout.trim();
       const stderr = result.stderr.trim();
@@ -340,29 +343,75 @@ function deactivateLocalSession(
   clearRemoteControlStatus(ctx);
 }
 
+// The daemon is a detached child process, never a shell command. `sh -lc "nohup … >/tmp/…"`
+// only works where sh is on PATH; Pi's exec helper turns a missing sh into an unreported
+// exit code, so a failed launch surfaced as a 10 s readiness timeout pointing at a log file
+// that was never created. Spawning directly keeps Windows paths out of a quoting layer and
+// behaves the same in POSIX shells, PowerShell, and cmd.
 async function ensureDaemonStarted(pi: ExtensionAPI): Promise<void> {
   const cli = cliCommand();
   const status = await pi.exec(cli.command, [...cli.args, "status"]);
   if (status.code === 0) return;
 
+  const logPath = daemonLogPath();
   const hostEntry = process.argv[1];
-  const hostEnv = hostEntry ? `PI_REMOTE_CONTROL_PI_ENTRY=${shellQuote(resolve(hostEntry))} ` : "";
-  const shellLine = `${hostEnv}nohup ${shellQuote(cli.command)} ${[...cli.args, "start"].map(shellQuote).join(" ")} </dev/null >/tmp/pi-remote-control.log 2>&1 &`;
-  await pi.exec("sh", ["-lc", shellLine]);
-  await waitForDaemonReady();
+  const log = openSync(logPath, "a");
+  const child = spawn(cli.command, [...cli.args, "start"], {
+    detached: true,
+    windowsHide: true,
+    stdio: ["ignore", log, log],
+    env: {
+      ...process.env,
+      ...(hostEntry ? { PI_REMOTE_CONTROL_PI_ENTRY: resolve(hostEntry) } : {}),
+    },
+  });
+  closeSync(log);
+  child.unref();
+
+  let failure: Error | undefined;
+  const onError = (error: Error) => {
+    failure ??= new Error(`pi-remote-control could not start: ${error.message}; see ${logPath}`);
+  };
+  const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    failure ??= new Error(`pi-remote-control exited (${code ?? signal}) before becoming ready; see ${logPath}`);
+  };
+  child.once("error", onError);
+  child.once("exit", onExit);
+
+  try {
+    const attempts = Number.parseInt(process.env.PI_REMOTE_CONTROL_READY_ATTEMPTS ?? "100", 10);
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (await daemonHealthy()) return;
+      // Report a dead daemon as soon as it is known dead instead of burning the whole budget.
+      if (failure) throw failure;
+      await delay(100);
+    }
+    if (await daemonHealthy()) return;
+    throw failure ?? new Error(`pi-remote-control did not become ready; see ${logPath}`);
+  } finally {
+    child.removeListener("error", onError);
+    child.removeListener("exit", onExit);
+  }
 }
 
-async function waitForDaemonReady(attempts = Number.parseInt(process.env.PI_REMOTE_CONTROL_READY_ATTEMPTS ?? "100", 10), delayMs = 100): Promise<void> {
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      const response = await fetch(`${await daemonBaseUrl()}/v1/health`);
-      if (response.ok) return;
-    } catch {
-      // The daemon may not have bound its HTTP port yet.
-    }
-    await delay(delayMs);
+async function daemonHealthy(): Promise<boolean> {
+  try {
+    return (await fetch(`${await daemonBaseUrl()}/v1/health`)).ok;
+  } catch {
+    // The daemon may not have bound its HTTP port yet.
+    return false;
   }
-  throw new Error("pi-remote-control did not become ready");
+}
+
+function daemonLogPath(): string {
+  return process.env.PI_REMOTE_CONTROL_LOG ?? join(tmpdir(), "pi-remote-control.log");
+}
+
+// Test seam for the real detached launch (tests/daemon-launch-real.test.ts). Always reports
+// "not running" so the caller exercises the spawn-and-wait path against a private state dir.
+export async function __launchDaemonForTests(): Promise<void> {
+  const exec = async () => ({ stdout: "", stderr: "", code: 1, killed: false });
+  await ensureDaemonStarted({ exec } as unknown as ExtensionAPI);
 }
 
 async function delay(ms: number): Promise<void> {
@@ -853,9 +902,7 @@ function cliCommand(): { command: string; args: string[] } {
   const distCli = resolve(packageRoot, "dist", "cli.js");
   if (existsSync(distCli)) return { command: process.execPath, args: [distCli] };
 
-  return { command: "pi-remote-control", args: [] };
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
+  // A bare `pi-remote-control` is unreachable when Pi runs from PowerShell or cmd, so name
+  // the broken layout instead of failing later with a swallowed spawn error.
+  throw new Error(`pi-remote-control found no daemon entry point under ${packageRoot}`);
 }
