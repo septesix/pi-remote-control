@@ -407,6 +407,13 @@ function daemonLogPath(): string {
   return process.env.PI_REMOTE_CONTROL_LOG ?? join(tmpdir(), "pi-remote-control.log");
 }
 
+// Test seam for the real detached launch (tests/daemon-launch-real.test.ts). Always reports
+// "not running" so the caller exercises the spawn-and-wait path against a private state dir.
+export async function __launchDaemonForTests(): Promise<void> {
+  const exec = async () => ({ stdout: "", stderr: "", code: 1, killed: false });
+  await ensureDaemonStarted({ exec } as unknown as ExtensionAPI);
+}
+
 async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
